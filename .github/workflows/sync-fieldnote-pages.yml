@@ -1,0 +1,102 @@
+name: Sync and deploy Fieldnote
+
+on:
+  schedule:
+    # Run a day after the Site's January 15 review, with time for its publish to finish.
+    - cron: '17 9 16 1 *'
+      timezone: America/Los_Angeles
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      publish: ${{ steps.sync.outputs.publish }}
+    steps:
+      - name: Stop after 2040
+        id: cutoff
+        shell: bash
+        run: |
+          year="$(date -u +%Y)"
+          if (( year > 2040 )); then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Check out main
+        if: steps.cutoff.outputs.publish == 'true'
+        uses: actions/checkout@v6
+        with:
+          ref: main
+      - name: Fetch and validate the current Fieldnote site
+        id: sync
+        if: steps.cutoff.outputs.publish == 'true'
+        shell: bash
+        env:
+          SOURCE_URL: https://fieldnote-cybersecurity.badgero-kent.chatgpt.site/
+        run: |
+          set -euo pipefail
+          candidate="$RUNNER_TEMP/fieldnote-index.html"
+          curl --fail --silent --show-error --location --retry 3 --connect-timeout 20 --max-time 90 "$SOURCE_URL" --output "$candidate"
+          bytes="$(wc -c < "$candidate" | tr -d ' ')"
+          if (( bytes < 10000 || bytes > 1000000 )); then
+            echo "Unexpected HTML size (${bytes} bytes); refusing to replace index.html." >&2
+            exit 1
+          fi
+          if ! grep -Eiq '<title>[^<]*Fieldnote[^<]*</title>' "$candidate"; then
+            echo "The downloaded page does not look like Fieldnote; refusing to publish it." >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_EVENT_NAME" == "schedule" ]]; then
+            year="$(date -u +%Y)"
+            if ! grep -Eiq "Last verified:</strong>[[:space:]]*[^<]*${year}" "$candidate"; then
+              echo "The hosted Site has not recorded a ${year} review; leaving the existing GitHub Pages copy unchanged." >&2
+              exit 1
+            fi
+          fi
+          if cmp -s "$candidate" index.html; then
+            echo "Fieldnote is unchanged."
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          cp "$candidate" index.html
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.html
+          git commit -m "Sync Fieldnote from live site"
+          git push origin HEAD:main
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+  deploy:
+    needs: sync
+    if: needs.sync.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check out the latest main branch
+        uses: actions/checkout@v6
+        with:
+          ref: main
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+      - name: Prepare the Pages artifact
+        shell: bash
+        run: |
+          mkdir -p _site
+          cp index.html _site/index.html
+      - name: Upload the Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
